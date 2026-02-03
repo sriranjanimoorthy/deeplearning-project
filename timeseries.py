@@ -1,164 +1,220 @@
+"""
+Advanced Time Series Forecasting with Deep Learning and Attention
+"""
+
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
+import math
+import random
 
-# -----------------------------
-# 1. Generate Multivariate Time Series Data
-# -----------------------------
-np.random.seed(42)
+# =============================
+# 1. REPRODUCIBILITY
+# =============================
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 
-time_steps = 1500
-t = np.arange(time_steps)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-data = pd.DataFrame({
-    "sensor_1": np.sin(0.02 * t) + np.random.normal(0, 0.1, time_steps),
-    "sensor_2": np.cos(0.015 * t) + np.random.normal(0, 0.1, time_steps),
-    "sensor_3": 0.5 * np.sin(0.01 * t) + np.random.normal(0, 0.1, time_steps),
-    "sensor_4": np.random.normal(0, 0.2, time_steps),
-    "sensor_5": 0.01 * t + np.random.normal(0, 0.2, time_steps)
-})
+# =============================
+# 2. SYNTHETIC DATA GENERATION
+# =============================
+def generate_multivariate_series(n_steps=1500):
+    t = np.arange(n_steps)
 
-target = data["sensor_1"].values.reshape(-1, 1)
+    f1 = np.sin(2 * np.pi * t / 24)                     # daily seasonality
+    f2 = np.sin(2 * np.pi * t / (24 * 7))                # weekly seasonality
+    f3 = 0.01 * t                                        # trend
+    f4 = np.random.normal(0, 0.5, n_steps)               # noise
+    f5 = np.cos(2 * np.pi * t / 12) * 0.5                # short seasonal
 
-# -----------------------------
-# 2. Scaling
-# -----------------------------
-scaler_x = MinMaxScaler()
-scaler_y = MinMaxScaler()
+    target = (
+        0.4 * f1 +
+        0.3 * f2 +
+        0.2 * f3 +
+        0.1 * f5 +
+        np.random.normal(0, 0.2, n_steps)
+    )
 
-X_scaled = scaler_x.fit_transform(data)
-y_scaled = scaler_y.fit_transform(target)
+    data = np.vstack([f1, f2, f3, f4, f5, target]).T
+    columns = ["f1", "f2", "f3", "f4", "f5", "target"]
+    return pd.DataFrame(data, columns=columns)
 
-# -----------------------------
-# 3. Sequence Creation
-# -----------------------------
-def create_sequences(X, y, input_len=30, output_len=5):
-    Xs, ys = [], []
-    for i in range(len(X) - input_len - output_len):
-        Xs.append(X[i:i+input_len])
-        ys.append(y[i+input_len:i+input_len+output_len])
-    return np.array(Xs), np.array(ys)
+df = generate_multivariate_series()
 
-INPUT_LEN = 30
-OUTPUT_LEN = 5
+# =============================
+# 3. DATA PREPROCESSING
+# =============================
+FEATURES = ["f1", "f2", "f3", "f4", "f5"]
+TARGET = "target"
 
-X_seq, y_seq = create_sequences(X_scaled, y_scaled, INPUT_LEN, OUTPUT_LEN)
+scaler_x = StandardScaler()
+scaler_y = StandardScaler()
+
+X_scaled = scaler_x.fit_transform(df[FEATURES])
+y_scaled = scaler_y.fit_transform(df[[TARGET]])
+
+SEQ_LEN = 48
+FORECAST_HORIZON = 1
+
+def create_sequences(X, y, seq_len):
+    xs, ys = [], []
+    for i in range(len(X) - seq_len):
+        xs.append(X[i:i+seq_len])
+        ys.append(y[i+seq_len])
+    return np.array(xs), np.array(ys)
+
+X_seq, y_seq = create_sequences(X_scaled, y_scaled, SEQ_LEN)
 
 split = int(0.8 * len(X_seq))
 X_train, X_test = X_seq[:split], X_seq[split:]
 y_train, y_test = y_seq[:split], y_seq[split:]
 
-# -----------------------------
-# 4. Attention Layer
-# -----------------------------
-class AttentionLayer(layers.Layer):
-    def _init_(self):
-        super()._init_()
+# =============================
+# 4. DATASET
+# =============================
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
 
-    def build(self, input_shape):
-        self.W = self.add_weight(shape=(input_shape[-1], input_shape[-1]),
-                                 initializer="random_normal",
-                                 trainable=True)
-        self.b = self.add_weight(shape=(input_shape[-1],),
-                                 initializer="zeros",
-                                 trainable=True)
-        self.u = self.add_weight(shape=(input_shape[-1], 1),
-                                 initializer="random_normal",
-                                 trainable=True)
+    def __len__(self):
+        return len(self.X)
 
-    def call(self, inputs):
-        score = tf.nn.tanh(tf.tensordot(inputs, self.W, axes=1) + self.b)
-        attention_weights = tf.nn.softmax(tf.tensordot(score, self.u, axes=1), axis=1)
-        context_vector = attention_weights * inputs
-        context_vector = tf.reduce_sum(context_vector, axis=1)
-        return context_vector, attention_weights
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
-# -----------------------------
-# 5. Encoder–Decoder Model with Attention
-# -----------------------------
-encoder_inputs = layers.Input(shape=(INPUT_LEN, X_train.shape[2]))
-encoder_lstm = layers.LSTM(64, return_sequences=True)(encoder_inputs)
+train_loader = DataLoader(TimeSeriesDataset(X_train, y_train), batch_size=64, shuffle=True)
+test_loader = DataLoader(TimeSeriesDataset(X_test, y_test), batch_size=64)
 
-attention_out, attention_weights = AttentionLayer()(encoder_lstm)
+# =============================
+# 5. BASELINE LSTM
+# =============================
+class BaselineLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
 
-decoder_output = layers.RepeatVector(OUTPUT_LEN)(attention_out)
-decoder_lstm = layers.LSTM(64, return_sequences=True)(decoder_output)
-final_output = layers.TimeDistributed(layers.Dense(1))(decoder_lstm)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        return self.fc(out)
 
-attention_model = models.Model(encoder_inputs, final_output)
-attention_model.compile(
-    optimizer="adam",
-    loss="mse"
-)
+# =============================
+# 6. ATTENTION MECHANISM
+# =============================
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attn = nn.Linear(hidden_dim, 1)
 
-# -----------------------------
-# 6. Baseline LSTM (No Attention)
-# -----------------------------
-baseline_model = models.Sequential([
-    layers.LSTM(64, input_shape=(INPUT_LEN, X_train.shape[2])),
-    layers.RepeatVector(OUTPUT_LEN),
-    layers.LSTM(64, return_sequences=True),
-    layers.TimeDistributed(layers.Dense(1))
-])
+    def forward(self, lstm_outputs):
+        scores = self.attn(lstm_outputs)
+        weights = torch.softmax(scores, dim=1)
+        context = torch.sum(weights * lstm_outputs, dim=1)
+        return context, weights
 
-baseline_model.compile(optimizer="adam", loss="mse")
+class LSTMAttentionModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.attention = Attention(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, 1)
 
-# -----------------------------
-# 7. Training
-# -----------------------------
-attention_model.fit(
-    X_train, y_train,
-    epochs=15,
-    batch_size=32,
-    validation_split=0.1,
-    verbose=1
-)
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        context, attn_weights = self.attention(lstm_out)
+        output = self.fc(context)
+        return output, attn_weights
 
-baseline_model.fit(
-    X_train, y_train,
-    epochs=15,
-    batch_size=32,
-    validation_split=0.1,
-    verbose=1
-)
+# =============================
+# 7. TRAINING FUNCTION
+# =============================
+def train_model(model, loader, epochs=20):
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
 
-# -----------------------------
-# 8. Evaluation
-# -----------------------------
-def evaluate(model, X, y):
-    preds = model.predict(X)
-    preds = scaler_y.inverse_transform(preds.reshape(-1, 1))
-    y_true = scaler_y.inverse_transform(y.reshape(-1, 1))
-    mae = mean_absolute_error(y_true, preds)
-    rmse = np.sqrt(mean_squared_error(y_true, preds))
-    mape = np.mean(np.abs((y_true - preds) / y_true)) * 100
-    return mae, rmse, mape
+    for epoch in range(epochs):
+        for Xb, yb in loader:
+            Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            preds = model(Xb)
+            if isinstance(preds, tuple):
+                preds = preds[0]
+            loss = criterion(preds, yb)
+            loss.backward()
+            optimizer.step()
 
-att_mae, att_rmse, att_mape = evaluate(attention_model, X_test, y_test)
-base_mae, base_rmse, base_mape = evaluate(baseline_model, X_test, y_test)
+        print(f"Epoch {epoch+1}/{epochs} | Loss: {loss.item():.4f}")
 
-print("\n--- Model Comparison ---")
-print(f"Attention Model -> MAE:{att_mae:.4f}, RMSE:{att_rmse:.4f}, MAPE:{att_mape:.2f}%")
-print(f"Baseline Model  -> MAE:{base_mae:.4f}, RMSE:{base_rmse:.4f}, MAPE:{base_mape:.2f}%")
+# =============================
+# 8. EVALUATION
+# =============================
+def evaluate(model, loader):
+    model.eval()
+    preds, trues = [], []
 
-# -----------------------------
-# 9. Attention Weight Visualization
-# -----------------------------
-attention_extractor = models.Model(
-    inputs=attention_model.input,
-    outputs=attention_weights
-)
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(DEVICE)
+            out = model(Xb)
+            if isinstance(out, tuple):
+                out = out[0]
+            preds.append(out.cpu().numpy())
+            trues.append(yb.numpy())
 
-weights = attention_extractor.predict(X_test[:1])[0]
+    preds = scaler_y.inverse_transform(np.vstack(preds))
+    trues = scaler_y.inverse_transform(np.vstack(trues))
 
-plt.figure(figsize=(10, 4))
-plt.imshow(weights, aspect="auto", cmap="viridis")
-plt.colorbar()
-plt.title("Attention Weights Across Time Steps")
-plt.xlabel("Features")
-plt.ylabel("Time Steps")
-plt.show()
+    rmse = math.sqrt(mean_squared_error(trues, preds))
+    mae = mean_absolute_error(trues, preds)
+    mape = np.mean(np.abs((trues - preds) / trues)) * 100
+
+    return rmse, mae, mape
+
+# =============================
+# 9. TRAIN BASELINE
+# =============================
+baseline = BaselineLSTM(len(FEATURES), 64).to(DEVICE)
+train_model(baseline, train_loader)
+baseline_metrics = evaluate(baseline, test_loader)
+
+# =============================
+# 10. TRAIN ATTENTION MODEL
+# =============================
+attn_model = LSTMAttentionModel(len(FEATURES), 64).to(DEVICE)
+train_model(attn_model, train_loader)
+attn_metrics = evaluate(attn_model, test_loader)
+
+print("\n--- Performance Comparison ---")
+print("Baseline LSTM  | RMSE:", baseline_metrics[0], "MAE:", baseline_metrics[1], "MAPE:", baseline_metrics[2])
+print("LSTM+Attention| RMSE:", attn_metrics[0], "MAE:", attn_metrics[1], "MAPE:", attn_metrics[2])
+
+# =============================
+# 11. ATTENTION VISUALIZATION
+# =============================
+def visualize_attention(model, dataset, samples=3):
+    model.eval()
+    for i in range(samples):
+        x, _ = dataset[i]
+        x = x.unsqueeze(0).to(DEVICE)
+        _, attn = model(x)
+        attn = attn.squeeze().cpu().numpy()
+
+        plt.figure(figsize=(8,3))
+        plt.plot(attn)
+        plt.title(f"Attention Weights – Test Sample {i+1}")
+        plt.xlabel("Time Steps")
+        plt.ylabel("Weight")
+        plt.show()
+
+visualize_attention(attn_model, TimeSeriesDataset(X_test, y_test))
